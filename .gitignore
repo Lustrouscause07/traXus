@@ -1,0 +1,62 @@
+# =========================
+# Secrets / env files
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Logs (SIEM safety)
+# =========================
+*.log
+*.out
+logs/
+log/
+var/log/
+backend/logs/
+frontend/logs/
+data/logs/
+
+# =========================
+# Databases / runtime state
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+*.wal
+*.shm
+data/
+storage/
+uploads/
+tmp/
+var/lib/
+backend/data/
+backend/storage/
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.mypy_cache/
+
+# =========================
+# Node / Frontend
+# =========================
+node_modules/
+dist/
+build/
+.cache/
+
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
