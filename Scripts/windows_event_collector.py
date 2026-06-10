@@ -1,192 +1,177 @@
 import json
-import subprocess
 import time
-import urllib.request
-from typing import Optional
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Any, List, Optional
 
-BACKEND_INGEST_URL = "http://127.0.0.1:8000/ingest"
-CHANNEL = "Application"  # later: "Security" (admin may be required)
-POLL_SECONDS = 5
-MAX_PER_POLL = 12
+INGEST_URL = "http://127.0.0.1:8000/ingest"
+CHANNELS = ["Application", "Security"]
+POLL_SECONDS = 3
+MAX_EVENTS_PER_POLL = 250  # per channel
 
-SEEN = set()
-SEEN_MAX = 5000
+SCRIPT_DIR = Path(__file__).resolve().parent
+BOOKMARK_FILE = SCRIPT_DIR / "collector_bookmarks.json"
 
-def post_event(evt: dict) -> None:
-    data = json.dumps(evt).encode("utf-8")
-    req = urllib.request.Request(
-        BACKEND_INGEST_URL,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        resp.read()
 
-def query_events(channel: str, max_events: int) -> list[str]:
-    cmd = ["wevtutil", "qe", channel, f"/c:{max_events}", "/rd:true", "/f:xml"]
-    out = subprocess.check_output(
-        cmd,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-    )
-    parts = out.split("</Event>")
-    events = []
-    for p in parts:
-        p = p.strip()
-        if "<Event" in p:
-            events.append(p + "</Event>")
-    return events
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-def extract_tag(xml: str, tag: str) -> Optional[str]:
-    """
-    Extract value inside <Tag>value</Tag> even if attributes exist: <Tag attr="x">value</Tag>
-    """
-    open_tag = f"<{tag}"
-    if open_tag not in xml:
-        return None
+
+def load_bookmarks() -> Dict[str, str]:
+    if BOOKMARK_FILE.exists():
+        try:
+            return json.loads(BOOKMARK_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_bookmarks(bm: Dict[str, str]) -> None:
+    BOOKMARK_FILE.write_text(json.dumps(bm, indent=2), encoding="utf-8")
+
+
+def post_json(url: str, payload: Dict[str, Any]) -> bool:
+    data = json.dumps(payload)
     try:
-        after = xml.split(open_tag, 1)[1]
-        val = after.split(">", 1)[1].split("<", 1)[0].strip()
-        return val if val else None
+        r = subprocess.run(
+            ["curl", "-s", "-X", "POST", url, "-H", "Content-Type: application/json", "-d", data],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        return r.returncode == 0
     except Exception:
-        return None
+        return False
 
-def extract_attr(xml: str, tag: str, attr: str) -> Optional[str]:
-    """
-    Extract attribute value like: <Provider Name="...">
-    """
-    open_tag = f"<{tag}"
-    if open_tag not in xml:
-        return None
+
+def read_events_from_channel(channel: str, last_record_id: Optional[int]) -> List[Dict[str, Any]]:
+    ps = f"""
+$last = {last_record_id if last_record_id is not None else 0}
+Get-WinEvent -LogName "{channel}" -MaxEvents {MAX_EVENTS_PER_POLL} |
+    Where-Object {{ $_.RecordId -gt $last }} |
+    Sort-Object RecordId |
+    ForEach-Object {{
+        [PSCustomObject]@{{
+            RecordId = $_.RecordId
+            TimeCreated = $_.TimeCreated.ToUniversalTime().ToString("o")
+            Id = $_.Id
+            ProviderName = $_.ProviderName
+            LevelDisplayName = $_.LevelDisplayName
+            MachineName = $_.MachineName
+            LogName = "{channel}"
+            Message = $_.Message
+            Xml = $_.ToXml()
+        }}
+    }} | ConvertTo-Json -Depth 5
+"""
     try:
-        chunk = xml.split(open_tag, 1)[1]
-        head = chunk.split(">", 1)[0]
-        key = f'{attr}="'
-        if key not in head:
-            return None
-        return head.split(key, 1)[1].split('"', 1)[0]
-    except Exception:
-        return None
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if out.returncode != 0:
+            err = (out.stderr or "").strip()
+            if err:
+                print(f"[collector] {channel}: PowerShell error: {err}")
+            return []
 
-def fingerprint_event(xml: str) -> str:
-    """
-    Prefer EventRecordID for dedup (best). Fallback to EventID + provider + XML slice.
-    """
-    record_id = extract_tag(xml, "EventRecordID")
-    event_id = extract_tag(xml, "EventID") or "unknown"
-    provider = extract_attr(xml, "Provider", "Name") or "unknown"
-    if record_id:
-        return f"{CHANNEL}|rec:{record_id}|eid:{event_id}|prov:{provider}"
-    return f"{CHANNEL}|eid:{event_id}|prov:{provider}|xml:{xml[:300]}"
+        if not out.stdout.strip():
+            return []
 
-def map_level(level: Optional[str]) -> str:
-    # Windows "Level" numbers: 1=Critical,2=Error,3=Warning,4=Information,5=Verbose
-    if not level:
-        return "unknown"
-    return {
-        "1": "critical",
-        "2": "error",
-        "3": "warning",
-        "4": "info",
-        "5": "verbose",
-    }.get(level.strip(), level.strip())
+        data = json.loads(out.stdout)
+        if isinstance(data, dict):
+            return [data]
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception as e:
+        print(f"[collector] {channel}: exception reading events: {e}")
+        return []
 
-def risk_for(event_id: str, level_name: str) -> int:
-    """
-    Application logs vary; use heuristic:
-    - errors/warnings raise baseline risk
-    - security-like IDs still mapped if you later switch CHANNEL.
-    """
-    # Security mappings (useful later if CHANNEL=Security)
-    if event_id == "4625":
-        return 80
-    if event_id == "4624":
+
+def risk_score(channel: str, event_id: int, level: str) -> int:
+    if channel.lower() == "security":
+        if event_id in (4625, 4740):
+            return 85
+        if event_id in (4672,):
+            return 70
+        if event_id in (4624,):
+            return 40
         return 25
-    if event_id == "4672":
-        return 70
-    if event_id == "4720":
-        return 75
-    if event_id == "4728":
-        return 85
 
-    # Application heuristic
-    if level_name == "critical":
-        return 70
-    if level_name == "error":
-        return 55
-    if level_name == "warning":
-        return 40
-    if level_name == "info":
-        return 20
-    return 15
+    if level and level.lower() in ("error", "critical"):
+        return 45
+    return 20
 
-def normalize(xml_event: str, idx: int) -> dict:
-    event_id = extract_tag(xml_event, "EventID") or "unknown"
-    record_id = extract_tag(xml_event, "EventRecordID")
-    computer = extract_tag(xml_event, "Computer")
-    provider = extract_attr(xml_event, "Provider", "Name")
-    level_num = extract_tag(xml_event, "Level")
-    level_name = map_level(level_num)
 
-    # Event type (simple)
-    if event_id == "4625":
-        event_type = "failed_login"
-    elif event_id == "4624":
-        event_type = "successful_login"
-    else:
-        event_type = "windows_event"
+def main():
+    print(f"[collector] ingest -> {INGEST_URL}")
+    print(f"[collector] channels: {CHANNELS}")
+    print(f"[collector] poll: {POLL_SECONDS}s")
+    print(f"[collector] bookmark file: {BOOKMARK_FILE}")
 
-    risk = risk_for(event_id, level_name)
+    bookmarks = load_bookmarks()
+    last_ids: Dict[str, int] = {}
 
-    return {
-        "id": f"win-{int(time.time())}-{idx}",
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "event_type": event_type,
-        "event_id": event_id,
-        "record_id": record_id,
-        "provider": provider,
-        "computer": computer,
-        "level": level_name,
-        "channel": CHANNEL,
-        "source": f"windows.{CHANNEL.lower()}",
-        "risk": risk,
-        "raw": xml_event[:3000],  # keep more raw, but still capped
-    }
-
-def main() -> None:
-    print(f"Collector running: channel={CHANNEL} -> {BACKEND_INGEST_URL}")
-    print("Tip: If you switch CHANNEL='Security' and get access denied, run terminal as Administrator.\n")
+    for ch in CHANNELS:
+        try:
+            last_ids[ch] = int(bookmarks.get(ch, "0"))
+        except Exception:
+            last_ids[ch] = 0
 
     while True:
-        try:
-            raw_events = query_events(CHANNEL, MAX_PER_POLL)
+        total_new = 0
+
+        for ch in CHANNELS:
+            last_id = last_ids.get(ch, 0)
+            events = read_events_from_channel(ch, last_id)
+
+            if not events:
+                print(f"[collector] {ch}: 0 new events")
+                continue
 
             sent = 0
-            for i, xml in enumerate(raw_events):
-                fp = fingerprint_event(xml)
-                if fp in SEEN:
-                    continue
+            for ev in events:
+                rid = int(ev.get("RecordId", 0) or 0)
+                eid = int(ev.get("Id", 0) or 0)
+                level = str(ev.get("LevelDisplayName", "") or "")
+                ts = str(ev.get("TimeCreated", "") or utc_now_iso())
+                machine = str(ev.get("MachineName", "") or "localhost")
+                provider = str(ev.get("ProviderName", "") or "")
 
-                SEEN.add(fp)
-                if len(SEEN) > SEEN_MAX:
-                    SEEN.clear()
+                payload = {
+                    "id": f"win-{ch.lower()}-{rid}",
+                    "timestamp": ts,
+                    "event_type": "windows_event" if ch.lower() != "security" else "security_event",
+                    "event_id": eid,
+                    "source": f"windows.{ch.lower()}",
+                    "asset": machine,
+                    "provider": provider,
+                    "level": level,
+                    "message": (ev.get("Message") or "")[:5000],
+                    "risk": risk_score(ch, eid, level),
+                    "raw": ev.get("Xml") or ev.get("Message") or "",
+                    "ingested_at": utc_now_iso(),
+                }
 
-                post_event(normalize(xml, i))
-                sent += 1
+                ok = post_json(INGEST_URL, payload)
+                if ok:
+                    sent += 1
+                    if rid > last_ids.get(ch, 0):
+                        last_ids[ch] = rid
 
-            print(f"Ingested {sent} new events from {CHANNEL}")
+            bookmarks[ch] = str(last_ids.get(ch, 0))
+            save_bookmarks(bookmarks)
 
-        except subprocess.CalledProcessError as e:
-            print("wevtutil error output:\n", e.output)
-            print("If access denied: run terminal as Administrator OR set CHANNEL='Application'\n")
+            print(f"[collector] {ch}: {sent} new events (bookmark -> {bookmarks[ch]})")
+            total_new += sent
 
-        except Exception as e:
-            print("Error:", e)
-
+        print(f"[collector] cycle total: {total_new}")
         time.sleep(POLL_SECONDS)
+
 
 if __name__ == "__main__":
     main()

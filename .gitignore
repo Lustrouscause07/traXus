@@ -60,3 +60,16 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# =========================
+# traXus runtime / launcher
+# =========================
+runtime/
+browser-profile/
+*.pid
+*.lnk
+
+# Vite cache
+.vite/
+
+Scripts/collector_bookmarks.json

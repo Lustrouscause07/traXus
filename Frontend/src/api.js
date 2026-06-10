@@ -6,14 +6,38 @@ export async function getHealth() {
   return res.json();
 }
 
-export async function getEvents() {
-  const res = await fetch(`${BASE}/events`);
+export async function getEvents(limit) {
+  const qs =
+    typeof limit === "number"
+      ? `?limit=${encodeURIComponent(String(limit))}`
+      : "";
+  const res = await fetch(`${BASE}/events${qs}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 
-export async function getAlerts() {
-  const res = await fetch(`${BASE}/alerts`);
+export async function getAlerts(limit) {
+  const qs =
+    typeof limit === "number"
+      ? `?limit=${encodeURIComponent(String(limit))}`
+      : "";
+  const res = await fetch(`${BASE}/alerts${qs}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function getCases(limit) {
+  const qs =
+    typeof limit === "number"
+      ? `?limit=${encodeURIComponent(String(limit))}`
+      : "";
+  const res = await fetch(`${BASE}/cases${qs}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function getEventAnalysis(eventId) {
+  const res = await fetch(`${BASE}/analyze/${encodeURIComponent(String(eventId))}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
