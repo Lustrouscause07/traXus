@@ -460,8 +460,8 @@ traXus/
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/Lustrouscause07/ISMS.git
-cd ISMS
+git clone https://github.com/Lustrouscause07/traXus.git
+cd traXus
 ```
 
 ### 2. Launch traXus
@@ -615,7 +615,7 @@ The implementation phase is considered complete for the current academic scope. 
 GitHub repository:
 
 ```text
-https://github.com/Lustrouscause07/ISMS
+https://github.com/Lustrouscause07/traXus
 ```
 
 ---
